@@ -1,204 +1,128 @@
-<!DOCTYPE html>
-<html lang="en">
-  <head>
-    <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>AI Assistant</title>
-    <style>
-      :root {
-        --bg: #0f172a;
-        --panel: #111827;
-        --panel-alt: #1f2937;
-        --text: #e5e7eb;
-        --muted: #94a3b8;
-        --primary: #60a5fa;
-        --secondary: #34d399;
-        --border: rgba(148, 163, 184, 0.25);
-      }
+from pathlib import Path
 
-      * {
-        box-sizing: border-box;
-      }
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
 
-      body {
-        margin: 0;
-        font-family: Arial, sans-serif;
-        background: linear-gradient(135deg, #020817 0%, #0f172a 100%);
-        color: var(--text);
-        min-height: 100vh;
-        display: grid;
-        place-items: center;
-      }
+from app.assistant import (
+    add_message,
+    create_session,
+    generate_response,
+    get_or_create_session,
+    get_session_history,
+    init_db,
+    list_documents,
+    list_sessions,
+    save_document,
+)
+from app.config import OPENAI_API_KEY
+from app.schemas import ChatRequest, ChatResponse, DocumentUploadResponse
 
-      .app {
-        width: min(900px, 92vw);
-        background: rgba(17, 24, 39, 0.9);
-        border: 1px solid var(--border);
-        border-radius: 16px;
-        box-shadow: 0 25px 60px rgba(0, 0, 0, 0.35);
-        overflow: hidden;
-      }
+app = FastAPI(
+    title="Advanced AI Assistant",
+    description="AI assistant with chat memory and RAG-powered document retrieval",
+    version="0.2.0",
+)
 
-      .header {
-        background: rgba(15, 23, 42, 0.8);
-        border-bottom: 1px solid var(--border);
-        padding: 1rem 1.25rem;
-      }
+BASE_DIR = Path(__file__).resolve().parent.parent
+STATIC_DIR = BASE_DIR / "static"
 
-      .header h1 {
-        margin: 0;
-        font-size: 1.4rem;
-      }
+app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
+init_db()
 
-      .chat-box {
-        min-height: 420px;
-        max-height: 60vh;
-        overflow-y: auto;
-        padding: 1.25rem;
-        background: rgba(15, 23, 42, 0.6);
-      }
 
-      .message {
-        margin-bottom: 1rem;
-        padding: 0.8rem 1rem;
-        border-radius: 12px;
-        max-width: 80%;
-        line-height: 1.5;
-      }
+@app.get("/")
+def index():
+    return FileResponse(STATIC_DIR / "index.html")
 
-      .message.user {
-        margin-left: auto;
-        background: rgba(96, 165, 250, 0.18);
-        border: 1px solid rgba(96, 165, 250, 0.3);
-      }
 
-      .message.assistant {
-        margin-right: auto;
-        background: rgba(52, 211, 153, 0.1);
-        border: 1px solid rgba(52, 211, 153, 0.3);
-      }
+@app.get("/api/health")
+def health_check():
+    return {
+        "status": "ok",
+        "message": "Advanced AI Assistant is running",
+        "ready": bool(OPENAI_API_KEY),
+    }
 
-      .input-row {
-        display: flex;
-        gap: 0.75rem;
-        padding: 1rem;
-        border-top: 1px solid var(--border);
-        background: rgba(15, 23, 42, 0.9);
-      }
 
-      textarea {
-        flex: 1;
-        min-height: 52px;
-        max-height: 160px;
-        resize: vertical;
-        border-radius: 12px;
-        border: 1px solid var(--border);
-        background: var(--panel-alt);
-        color: var(--text);
-        padding: 0.8rem 1rem;
-        font-size: 1rem;
-      }
+@app.get("/api/sessions")
+def sessions():
+    return {"sessions": list_sessions()}
 
-      button {
-        border: none;
-        border-radius: 12px;
-        background: linear-gradient(135deg, var(--primary), #2563eb);
-        color: white;
-        padding: 0.9rem 1.2rem;
-        font-size: 1rem;
-        font-weight: 600;
-        cursor: pointer;
-      }
 
-      button:hover {
-        opacity: 0.95;
-      }
+@app.get("/api/documents")
+def documents():
+    return {"documents": list_documents()}
 
-      button:disabled {
-        opacity: 0.7;
-        cursor: wait;
-      }
 
-      .status {
-        color: var(--muted);
-        font-size: 0.8rem;
-        padding: 0 1rem 0.5rem;
-      }
-    </style>
-  </head>
-  <body>
-    <div class="app">
-      <div class="header">
-        <h1>AI Assistant Starter</h1>
-      </div>
-      <div class="chat-box" id="chatBox">
-        <div class="message assistant">
-          Hello! I’m your AI assistant. Ask me anything.
-        </div>
-      </div>
-      <div class="status" id="status">Ready</div>
-      <div class="input-row">
-        <textarea id="prompt" rows="1" placeholder="Type your message..."></textarea>
-        <button id="sendBtn">Send</button>
-      </div>
-    </div>
+@app.post("/api/chat", response_model=ChatResponse)
+def chat(request: ChatRequest):
+    if not request.message and not request.messages:
+        raise HTTPException(status_code=400, detail="A message is required.")
 
-    <script>
-      const chatBox = document.getElementById('chatBox');
-      const promptInput = document.getElementById('prompt');
-      const sendBtn = document.getElementById('sendBtn');
-      const statusEl = document.getElementById('status');
+    if not OPENAI_API_KEY:
+        raise HTTPException(
+            status_code=500,
+            detail="OPENAI_API_KEY is not set. Add it to your .env file.",
+        )
 
-      function appendMessage(role, text) {
-        const message = document.createElement('div');
-        message.className = `message ${role}`;
-        message.textContent = text;
-        chatBox.appendChild(message);
-        chatBox.scrollTop = chatBox.scrollHeight;
-      }
+    session_id = get_or_create_session(request.session_id)
 
-      async function sendMessage() {
-        const text = promptInput.value.trim();
-        if (!text) return;
+    if request.messages:
+        conversation = request.messages
+        user_text = "\n".join(msg.content for msg in conversation if msg.role == "user")
+        if not user_text:
+            raise HTTPException(status_code=400, detail="No user message was provided.")
+        user_input = user_text
+    else:
+        user_input = request.message or ""
 
-        appendMessage('user', text);
-        promptInput.value = '';
-        promptInput.focus();
-        sendBtn.disabled = true;
-        statusEl.textContent = 'Thinking...';
+    if not user_input.strip():
+        raise HTTPException(status_code=400, detail="Message cannot be empty.")
 
-        try {
-          const response = await fetch('/api/chat', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              messages: [{ role: 'user', content: text }],
-            }),
-          });
+    try:
+        reply = generate_response(session_id, user_input)
+        add_message(session_id, "user", user_input)
+        add_message(session_id, "assistant", reply)
+        return ChatResponse(session_id=session_id, reply=reply)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"AI request failed: {str(exc)}") from exc
 
-          const data = await response.json();
 
-          if (!response.ok) {
-            throw new Error(data.detail || 'Request failed');
-          }
+@app.post("/api/documents/upload", response_model=DocumentUploadResponse)
+async def upload_document(file: UploadFile = File(...), title: str = Form(default="Uploaded document")):
+    if not file.filename:
+        raise HTTPException(status_code=400, detail="A file is required.")
 
-          appendMessage('assistant', data.reply || 'No response');
-          statusEl.textContent = 'Ready';
-        } catch (error) {
-          appendMessage('assistant', `Error: ${error.message}`);
-          statusEl.textContent = 'Error';
-        } finally {
-          sendBtn.disabled = false;
-        }
-      }
+    if not OPENAI_API_KEY:
+        raise HTTPException(
+            status_code=500,
+            detail="OPENAI_API_KEY is not set. Add it to your .env file.",
+        )
 
-      sendBtn.addEventListener('click', sendMessage);
-      promptInput.addEventListener('keydown', (event) => {
-        if (event.key === 'Enter' && !event.shiftKey) {
-          event.preventDefault();
-          sendMessage();
-        }
-      });
-    </script>
-  </body>
-</html>
+    file_bytes = await file.read()
+    try:
+        content = file_bytes.decode("utf-8")
+    except UnicodeDecodeError:
+        raise HTTPException(
+            status_code=400,
+            detail="Only UTF-8 text files are supported. Try a .txt, .md, or .json file.",
+        )
+
+    if not content.strip():
+        raise HTTPException(status_code=400, detail="The uploaded file is empty.")
+
+    try:
+        document_id = save_document(title or file.filename, content)
+        return DocumentUploadResponse(
+            id=document_id,
+            title=title or file.filename,
+            message="Document uploaded and indexed successfully.",
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Document upload failed: {str(exc)}") from exc
+
+
+@app.get("/api/sessions/{session_id}/history")
+def session_history(session_id: str):
+    return {"session_id": session_id, "messages": get_session_history(session_id)}

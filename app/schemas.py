@@ -1,16 +1,10 @@
-from pydantic import BaseModel, Field
-from typing import List
+import os
+from pathlib import Path
 
+BASE_DIR = Path(__file__).resolve().parent.parent
+DATA_DIR = BASE_DIR / "data"
+DATABASE_PATH = DATA_DIR / "assistant.db"
 
-class ChatMessage(BaseModel):
-    role: str = Field(..., description="Message role: user, assistant, or system")
-    content: str = Field(..., min_length=1, description="Message content")
-
-
-class ChatRequest(BaseModel):
-    messages: List[ChatMessage] = Field(..., description="Conversation history or current prompt")
-    temperature: float = Field(default=0.7, ge=0.0, le=2.0, description="Model creativity")
-
-
-class ChatResponse(BaseModel):
-    reply: str
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "text-embedding-3-small")
