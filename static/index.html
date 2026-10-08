@@ -1,128 +1,146 @@
-from pathlib import Path
-
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import Depends, FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
-from app.assistant import (
+from app.assistant import create_embedding, generate_response, search_documents_by_query, split_text
+from app.auth import create_access_token, get_current_user
+from app.config import OPENAI_API_KEY
+from app.database import (
     add_message,
     create_session,
-    generate_response,
-    get_or_create_session,
+    create_user,
+    ensure_session_title,
+    get_or_create_session_for_user,
+    get_session_for_user,
     get_session_history,
+    get_user_by_username,
     init_db,
-    list_documents,
-    list_sessions,
+    list_documents_for_user,
+    list_sessions_for_user,
     save_document,
+    store_document_chunks,
 )
-from app.config import OPENAI_API_KEY
-from app.schemas import ChatRequest, ChatResponse, DocumentUploadResponse
+from app.schemas import ChatRequest, ChatResponse, DocumentUploadResponse, TokenResponse, UserLoginRequest, UserRegisterRequest
 
 app = FastAPI(
-    title="Advanced AI Assistant",
-    description="AI assistant with chat memory and RAG-powered document retrieval",
-    version="0.2.0",
+    title="Production AI Assistant",
+    description="Secure AI assistant with user auth, memory, and document retrieval",
+    version="0.3.0",
 )
 
-BASE_DIR = Path(__file__).resolve().parent.parent
-STATIC_DIR = BASE_DIR / "static"
+app.mount("/static", StaticFiles(directory="static"), name="static")
 
-app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 init_db()
 
 
 @app.get("/")
 def index():
-    return FileResponse(STATIC_DIR / "index.html")
+    return FileResponse("static/index.html")
 
 
 @app.get("/api/health")
 def health_check():
     return {
         "status": "ok",
-        "message": "Advanced AI Assistant is running",
+        "message": "AI Assistant is running",
         "ready": bool(OPENAI_API_KEY),
     }
 
 
+@app.post("/api/auth/register", response_model=TokenResponse)
+def register_user(payload: UserRegisterRequest):
+    existing = get_user_by_username(payload.username)
+    if existing:
+        raise HTTPException(status_code=400, detail="Username already exists")
+
+    import hashlib
+    password_hash = hashlib.sha256(payload.password.encode("utf-8")).hexdigest()
+    user = create_user(payload.username, password_hash)
+    token = create_access_token(str(user["id"]))
+    return TokenResponse(access_token=token)
+
+
+@app.post("/api/auth/login", response_model=TokenResponse)
+def login_user(payload: UserLoginRequest):
+    import hashlib
+    password_hash = hashlib.sha256(payload.password.encode("utf-8")).hexdigest()
+    user = get_user_by_username(payload.username)
+    if not user or user["password_hash"] != password_hash:
+        raise HTTPException(status_code=401, detail="Invalid username or password")
+
+    token = create_access_token(str(user["id"]))
+    return TokenResponse(access_token=token)
+
+
 @app.get("/api/sessions")
-def sessions():
-    return {"sessions": list_sessions()}
+def list_sessions(current_user: dict = Depends(get_current_user)):
+    return {"sessions": list_sessions_for_user(current_user["id"])}
 
 
 @app.get("/api/documents")
-def documents():
-    return {"documents": list_documents()}
+def list_documents(current_user: dict = Depends(get_current_user)):
+    return {"documents": list_documents_for_user(current_user["id"])}
+
+
+@app.get("/api/sessions/{session_id}/history")
+def session_history(session_id: str, current_user: dict = Depends(get_current_user)):
+    history = get_session_history(session_id, current_user["id"])
+    return {"session_id": session_id, "messages": history}
 
 
 @app.post("/api/chat", response_model=ChatResponse)
-def chat(request: ChatRequest):
-    if not request.message and not request.messages:
-        raise HTTPException(status_code=400, detail="A message is required.")
+def chat(payload: ChatRequest, current_user: dict = Depends(get_current_user)):
+    if not payload.message and not payload.messages:
+        raise HTTPException(status_code=400, detail="A message is required")
 
     if not OPENAI_API_KEY:
-        raise HTTPException(
-            status_code=500,
-            detail="OPENAI_API_KEY is not set. Add it to your .env file.",
-        )
+        raise HTTPException(status_code=500, detail="OPENAI_API_KEY is not set")
 
-    session_id = get_or_create_session(request.session_id)
+    session_id = get_or_create_session_for_user(current_user["id"], payload.session_id)
 
-    if request.messages:
-        conversation = request.messages
-        user_text = "\n".join(msg.content for msg in conversation if msg.role == "user")
-        if not user_text:
-            raise HTTPException(status_code=400, detail="No user message was provided.")
-        user_input = user_text
+    if payload.messages:
+        user_input = "\n".join(msg.content for msg in payload.messages if msg.role == "user")
     else:
-        user_input = request.message or ""
+        user_input = payload.message or ""
 
     if not user_input.strip():
-        raise HTTPException(status_code=400, detail="Message cannot be empty.")
+        raise HTTPException(status_code=400, detail="Message cannot be empty")
 
     try:
-        reply = generate_response(session_id, user_input)
-        add_message(session_id, "user", user_input)
-        add_message(session_id, "assistant", reply)
+        reply = generate_response(current_user["id"], session_id, user_input, temperature=payload.temperature)
+        add_message(session_id, current_user["id"], "user", user_input)
+        add_message(session_id, current_user["id"], "assistant", reply)
+        if session_id and not get_session_for_user(session_id, current_user["id"]):
+            raise HTTPException(status_code=404, detail="Session not found")
         return ChatResponse(session_id=session_id, reply=reply)
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"AI request failed: {str(exc)}") from exc
 
 
 @app.post("/api/documents/upload", response_model=DocumentUploadResponse)
-async def upload_document(file: UploadFile = File(...), title: str = Form(default="Uploaded document")):
+async def upload_document(
+    file: UploadFile = File(...),
+    title: str = Form(default="Uploaded document"),
+    current_user: dict = Depends(get_current_user),
+):
     if not file.filename:
-        raise HTTPException(status_code=400, detail="A file is required.")
+        raise HTTPException(status_code=400, detail="File is required")
 
     if not OPENAI_API_KEY:
-        raise HTTPException(
-            status_code=500,
-            detail="OPENAI_API_KEY is not set. Add it to your .env file.",
-        )
+        raise HTTPException(status_code=500, detail="OPENAI_API_KEY is not set")
 
-    file_bytes = await file.read()
-    try:
-        content = file_bytes.decode("utf-8")
-    except UnicodeDecodeError:
-        raise HTTPException(
-            status_code=400,
-            detail="Only UTF-8 text files are supported. Try a .txt, .md, or .json file.",
-        )
-
+    content = (await file.read()).decode("utf-8", errors="strict")
     if not content.strip():
-        raise HTTPException(status_code=400, detail="The uploaded file is empty.")
+        raise HTTPException(status_code=400, detail="Uploaded file is empty")
 
-    try:
-        document_id = save_document(title or file.filename, content)
-        return DocumentUploadResponse(
-            id=document_id,
-            title=title or file.filename,
-            message="Document uploaded and indexed successfully.",
-        )
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"Document upload failed: {str(exc)}") from exc
+    doc_id = save_document(current_user["id"], title or file.filename, content)
+    chunks = split_text(content)
+    if chunks:
+        embeddings = [create_embedding(chunk) for chunk in chunks]
+        store_document_chunks(current_user["id"], doc_id, chunks, embeddings)
 
-
-@app.get("/api/sessions/{session_id}/history")
-def session_history(session_id: str):
-    return {"session_id": session_id, "messages": get_session_history(session_id)}
+    return DocumentUploadResponse(
+        id=doc_id,
+        title=title or file.filename,
+        message="Document uploaded and indexed successfully",
+    )
